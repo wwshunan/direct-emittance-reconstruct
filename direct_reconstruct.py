@@ -5,6 +5,12 @@ import matplotlib
 import os
 from wrdis import *
 from mpl_toolkits import mplot3d
+from shapely.ops import cascaded_union, polygonize
+from scipy.spatial import Delaunay
+import math
+import shapely.geometry as geometry
+from matplotlib import path
+from matplotlib.collections import LineCollection
 
 lattice_name = 'MEBT_emittace.dat'
 txt = '''FREQ 162.5  
@@ -35,6 +41,65 @@ DRIFT 122.5 40 0
 end
 '''
 
+def alpha_shape(points, alpha):
+    """
+    Compute the alpha shape (concave hull) of a set of points.
+
+    @param points: Iterable container of points.
+    @param alpha: alpha value to influence the gooeyness of the border. Smaller
+                  numbers don't fall inward as much as larger numbers. Too large,
+                  and you lose everything!
+    """
+    if len(points) < 4:
+        # When you have a triangle, there is no sense in computing an alpha
+        # shape.
+        points = list(zip(points[:, 0], points[:, 1]))
+        return geometry.MultiPoint(list(points)).convex_hull
+
+    def add_edge(edges, edge_points, coords, i, j):
+        """Add a line between the i-th and j-th points, if not in the list already"""
+        if (i, j) in edges or (j, i) in edges:
+            # already added
+            return
+        edges.add((i, j))
+        edge_points.append(coords[[i, j]])
+
+    #coords = np.array([point.coords[0] for point in points])
+    coords = points
+
+    tri = Delaunay(coords)
+    edges = set()
+    edge_points = []
+    # loop over triangles:
+    # ia, ib, ic = indices of corner points of the triangle
+    for ia, ib, ic in tri.vertices:
+        pa = coords[ia]
+        pb = coords[ib]
+        pc = coords[ic]
+
+        # Lengths of sides of triangle
+        a = math.sqrt((pa[0]-pb[0])**2 + (pa[1]-pb[1])**2)
+        b = math.sqrt((pb[0]-pc[0])**2 + (pb[1]-pc[1])**2)
+        c = math.sqrt((pc[0]-pa[0])**2 + (pc[1]-pa[1])**2)
+
+        # Semiperimeter of triangle
+        s = (a + b + c)/2.0
+
+        # Area of triangle by Heron's formula
+        area = math.sqrt(s*(s-a)*(s-b)*(s-c))
+        circum_r = a*b*c/(4.0*area)
+
+        # Here's the radius filter.
+        #print circum_r
+        if circum_r < 1.0/alpha:
+            add_edge(edges, edge_points, coords, ia, ib)
+            add_edge(edges, edge_points, coords, ib, ic)
+            add_edge(edges, edge_points, coords, ic, ia)
+
+    m = geometry.MultiLineString(edge_points)
+    triangles = list(polygonize(m))
+    return cascaded_union(triangles), edge_points
+
 def surface_graph(xs, ys, weights):
     x_min, x_max = xs.min(), xs.max()
     y_min, y_max = ys.min(), ys.max()
@@ -52,11 +117,14 @@ def part_regen(xs, xps, weights, xgrid, xpgrid, nparts_t, halo):
     var_x = np.average((xs - avg_x)**2,  weights=weights)
     avg_xp = np.average(xps, weights=weights)
     var_xp = np.average((xps - avg_xp)**2,  weights=weights)
-    covar = np.average(xs * xps, weights=weights)
-    rot_angle = np.arctan(2 * covar / (var_x - var_xp)) / 2
 
     x_old = xs - avg_x
     xp_old = xps - avg_xp
+
+    covar = np.average(x_old * xp_old, weights=weights)
+    rot_angle = np.arctan(2 * covar / (var_x - var_xp)) / 2
+
+
     x_new = np.cos(rot_angle) * x_old + np.sin(rot_angle) * xp_old
     xp_new = -np.sin(rot_angle) * x_old + np.cos(rot_angle) * xp_old
 
@@ -157,13 +225,13 @@ def calc_weights(x_distr_start, y_distr_start, x_distr_end, y_distr_end, x_measu
     avg_y = np.average(y_measure, weights=weights_measure)
     var_y = np.average((y_measure - avg_y)**2,  weights=weights_measure)
     covar = np.average(x_measure * y_measure, weights=weights_measure)
-    rot_angle = np.arctan(2 * covar / (var_x - var_y)) / 2
+    #rot_angle = np.arctan(2 * covar / (var_x - var_y)) / 2
 
     x_old = x_measure - avg_x
     y_old = y_measure - avg_y
-    x_new = np.cos(rot_angle) * x_old + np.sin(rot_angle) * y_old
-    y_new = -np.sin(rot_angle) * x_old + np.cos(rot_angle) * y_old
-    #x_new, y_new = x_old, y_old
+    #x_new = np.cos(rot_angle) * x_old + np.sin(rot_angle) * y_old
+    #y_new = -np.sin(rot_angle) * x_old + np.cos(rot_angle) * y_old
+    x_new, y_new = x_old, y_old
 
     x_min = min(x_new)
     x_max = max(x_new)
@@ -185,10 +253,25 @@ def calc_weights(x_distr_start, y_distr_start, x_distr_end, y_distr_end, x_measu
     x_grid, y_grid = np.meshgrid(x_range, y_range)
     weights_grid = interpolate.griddata((x_new, y_new), weights_measure, (x_grid, y_grid), fill_value=0,
                                         method='linear')
+    concave_hull, edge_points = alpha_shape(np.c_[x_new, y_new], alpha=0.2)
+    lines = LineCollection(edge_points)
+    plt.figure(figsize=(10, 10))
+    plt.gca().add_collection(lines)
+    boundary = np.vstack(concave_hull.exterior.coords)
+    p = path.Path(boundary)
+    flags = p.contains_points(np.c_[x_grid.ravel(), y_grid.ravel()])
+    flags = flags.reshape(xgrid, ygrid)
+    weights_grid[~flags] = 0
+    #plt.plot(x_new, y_new, 'r.')
+    x_test = x_grid[weights_grid>0]
+    y_test = y_grid[weights_grid>0]
+    #x_test = x_grid
+    #y_test = y_grid
 
-    x_end_new = np.cos(rot_angle) * x_distr_end + np.sin(rot_angle) * y_distr_end
-    y_end_new = -np.sin(rot_angle) * x_distr_end + np.cos(rot_angle) * y_distr_end
-    #x_end_new, y_end_new = x_distr_end, y_distr_end
+
+    #x_end_new = np.cos(rot_angle) * x_distr_end + np.sin(rot_angle) * y_distr_end
+    #y_end_new = -np.sin(rot_angle) * x_distr_end + np.cos(rot_angle) * y_distr_end
+    x_end_new, y_end_new = x_distr_end, y_distr_end
 
     mask = (x_end_new > x_min) & (x_end_new < x_max) & (y_end_new > y_min) & (y_end_new < y_max)
     x_end_mask = x_end_new[mask]
@@ -198,6 +281,8 @@ def calc_weights(x_distr_start, y_distr_start, x_distr_end, y_distr_end, x_measu
     #weights = np.zeros_like(x_end_mask)
     weights = interpolate.griddata((x_grid.ravel(), y_grid.ravel()), weights_grid.ravel(),
                                    (x_end_mask, y_end_mask), fill_value=0, method='linear')
+    #noise = weights < weights.max() * 0.005
+    #weights[noise] = 0
     #surface_graph(x_end_mask, y_end_mask, weights)
 
     return x_start_mask, y_start_mask, weights
